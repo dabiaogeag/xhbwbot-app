@@ -1,8 +1,10 @@
 /**
- * 从平台 URL 下载 icon / splash；本地 xh.ms 等 CI 不可达时用 resources/bundled
+ * 优先使用平台配置的图片；CI 无法下载时使用仓库资源或内置图片。
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import './ensure-bundled-assets.mjs';
 import { isPngImage } from './lib/png-image.mjs';
@@ -43,8 +45,19 @@ function absUrl(base, rel) {
   return `${b}${u.startsWith('/') ? u : `/${u}`}`;
 }
 
-async function download(label, url, dest) {
-  if (!url) return false;
+const convertToPng = `
+import io
+import sys
+from PIL import Image, ImageOps
+
+with Image.open(io.BytesIO(sys.stdin.buffer.read())) as image:
+    ImageOps.exif_transpose(image).convert("RGBA").save(sys.stdout.buffer, format="PNG")
+`;
+
+async function download(label, url, name, minimumSize = 2) {
+  if (!url || isPrivateHost(url)) return false;
+  const dest = path.join(assetsDir, name);
+  const staged = path.join(assetsDir, `.${name}.${randomUUID()}.tmp`);
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(120000) });
     if (!res.ok) {
@@ -56,18 +69,34 @@ async function download(label, url, dest) {
       console.warn(`download-assets: FAIL ${url} too small (${buf.length} bytes)`);
       return false;
     }
-    fs.writeFileSync(dest, buf);
-    console.log(`download-assets: OK ${label} (${buf.length} bytes) <- ${url}`);
+    fs.writeFileSync(staged, buf);
+    if (!isPngImage(staged, minimumSize, minimumSize)) {
+      const converted = spawnSync(process.env.PYTHON_BIN || 'python3', ['-c', convertToPng], {
+        input: buf,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      if (converted.status !== 0) {
+        throw new Error(converted.error?.message || converted.stderr.toString().trim() || 'PNG conversion failed');
+      }
+      fs.writeFileSync(staged, converted.stdout);
+    }
+    if (!isPngImage(staged, minimumSize, minimumSize)) {
+      throw new Error(`image must be at least ${minimumSize}x${minimumSize} pixels`);
+    }
+    fs.renameSync(staged, dest);
+    console.log(`download-assets: OK ${label} (${fs.statSync(dest).size} PNG bytes) <- ${url}`);
     return true;
   } catch (e) {
     console.warn(`download-assets: FAIL ${url}`, e.message);
     return false;
+  } finally {
+    fs.rmSync(staged, { force: true });
   }
 }
 
-function useRepoAsset(name) {
+function useRepoAsset(name, minimumSize = 2) {
   const dest = path.join(assetsDir, name);
-  if (isPngImage(dest, 2, 2)) {
+  if (isPngImage(dest, minimumSize, minimumSize)) {
     console.log(`download-assets: use repo resources/${name} (${fs.statSync(dest).size} bytes)`);
     return true;
   }
@@ -84,22 +113,15 @@ if (skipRemote) {
   console.log('download-assets: skip remote (local/private PLATFORM_URL), prefer repo resources/');
 }
 
-let iconOk = useRepoAsset('icon.png', 4096);
 const splashEnabled = process.env.SPLASH_ENABLED !== 'false';
-let splashOk = splashEnabled && useRepoAsset('splash.png');
-let squareOk = useRepoAsset('square-icon.png', 4096);
-
-if (!iconOk && iconUrl && !isPrivateHost(iconUrl)) {
-  iconOk = await download('icon', iconUrl, path.join(assetsDir, 'icon.png'));
+let iconOk = await download('icon', iconUrl, 'icon.png', 48) || useRepoAsset('icon.png', 48);
+if (!iconOk) {
+  iconOk = await download('icon-from-square', squareUrl, 'icon.png', 48);
 }
-if (!iconOk && squareUrl && !isPrivateHost(squareUrl)) {
-  iconOk = await download('icon-from-square', squareUrl, path.join(assetsDir, 'icon.png'));
-}
-if (!squareOk && squareUrl && !isPrivateHost(squareUrl)) {
-  squareOk = await download('square-icon', squareUrl, path.join(assetsDir, 'square-icon.png'));
-}
-if (splashEnabled && !splashOk && splashUrl && !isPrivateHost(splashUrl)) {
-  splashOk = await download('splash', splashUrl, path.join(assetsDir, 'splash.png'));
+let squareOk = await download('square-icon', squareUrl, 'square-icon.png', 48) || useRepoAsset('square-icon.png', 48);
+let splashOk = false;
+if (splashEnabled) {
+  splashOk = await download('splash', splashUrl, 'splash.png') || useRepoAsset('splash.png');
 }
 
 if (!iconOk) iconOk = copyBundled('icon.png') || copyBundled('square-icon.png');
@@ -109,4 +131,4 @@ if (!squareOk && !fs.existsSync(path.join(assetsDir, 'square-icon.png'))) {
 }
 
 if (!iconOk) console.warn('download-assets: no launcher icon');
-if (!splashOk) console.warn('download-assets: no splash');
+if (splashEnabled && !splashOk) console.warn('download-assets: no splash');
