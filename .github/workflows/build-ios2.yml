@@ -111,8 +111,10 @@ jobs:
           SQUARE_ICON_URL: ${{ inputs.square_icon_url }}
         run: |
           node scripts/apply-build-config.mjs
-          node scripts/ensure-bundled-assets.mjs
-          node scripts/download-assets.mjs || true
+          python3 -m venv "$RUNNER_TEMP/appbuilder-ios-assets"
+          python_bin="$RUNNER_TEMP/appbuilder-ios-assets/bin/python"
+          "$python_bin" -m pip install --quiet Pillow
+          PYTHON_BIN="$python_bin" node scripts/download-assets.mjs
 
       - name: Capacitor add iOS
         env:
@@ -127,6 +129,67 @@ jobs:
           npx cap add ios
           npx cap sync ios
           test -d ios/App
+
+      - name: Apply iOS app icon & launch image
+        run: |
+          "$RUNNER_TEMP/appbuilder-ios-assets/bin/python" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          from PIL import Image, ImageOps
+
+          app = Path("ios/App/App")
+          assets = app / "Assets.xcassets"
+          source = Path("resources")
+
+          def write_asset(folder, filename, properties):
+              catalog = assets / folder / "Contents.json"
+              contents = json.loads(catalog.read_text(encoding="utf-8"))
+              contents["images"] = [{"idiom": "universal", "filename": filename, **properties}]
+              catalog.write_text(json.dumps(contents, indent=2) + "\n", encoding="utf-8")
+              return catalog.with_name(filename)
+
+          icon_path = source / "icon.png"
+          if icon_path.is_file():
+              with Image.open(icon_path) as icon:
+                  if min(icon.size) >= 48:
+                      icon = ImageOps.pad(icon.convert("RGBA"), (1024, 1024), Image.Resampling.LANCZOS)
+                      opaque = Image.alpha_composite(Image.new("RGBA", icon.size, "white"), icon).convert("RGB")
+                      opaque.save(write_asset("AppIcon.appiconset", "AppBuilderIcon.png",
+                                              {"platform": "ios", "size": "1024x1024"}))
+                      print("iOS assets: applied AppIcon (1024x1024)")
+
+          storyboard = app / "Base.lproj" / "LaunchScreen.storyboard"
+          launch = ET.parse(storyboard)
+          view = launch.find('.//imageView[@image="Splash"]')
+          image_entry = launch.find('./resources/image[@name="Splash"]')
+          if view is None or image_entry is None:
+              raise RuntimeError("Capacitor launch screen does not reference the Splash asset")
+
+          if os.environ.get("SPLASH_ENABLED") == "false":
+              view.attrib.pop("image")
+              launch.find("./resources").remove(image_entry)
+              print("iOS assets: launch image disabled")
+          elif (source / "splash.png").is_file():
+              with Image.open(source / "splash.png") as splash:
+                  if min(splash.size) >= 2:
+                      splash = splash.convert("RGBA")
+                      splash.save(write_asset("Splash.imageset", "AppBuilderLaunch.png", {"scale": "1x"}))
+                      view.set("contentMode", "scaleAspectFit")
+                      image_entry.set("width", str(splash.width))
+                      image_entry.set("height", str(splash.height))
+                      red, green, blue, alpha = splash.getpixel((0, 0))
+                      background = view.find('./color[@key="backgroundColor"]')
+                      if background is not None:
+                          background.attrib.clear()
+                          background.attrib.update(key="backgroundColor", alpha="1", colorSpace="custom",
+                                                   customColorSpace="sRGB", red=str(red * alpha / 65025),
+                                                   green=str(green * alpha / 65025), blue=str(blue * alpha / 65025))
+                      print(f"iOS assets: applied Splash ({splash.width}x{splash.height}, aspect fit)")
+          launch.write(storyboard, encoding="UTF-8", xml_declaration=True)
+          PY
 
       - name: Verify iOS shell
         env:
